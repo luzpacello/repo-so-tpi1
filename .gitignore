@@ -1,0 +1,30 @@
+# === Go / Wails ===
+build/bin/          # ejecutables compilados
+build/cache/        # cache intermedia de wails
+wailsjs/            # bindings generados por Wails (se pueden regenerar)
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# === Node / Vite ===
+node_modules/
+frontend/dist/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# === IDE / Editores ===
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# === SO ===
+.DS_Store        # macOS
+Thumbs.db        # Windows
+
+# === Otros ===
+.env             # si llegás a usar variables de entorno
