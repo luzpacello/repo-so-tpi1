@@ -1,12 +1,13 @@
 # === Go / Wails ===
-build/bin/          # ejecutables compilados
-build/cache/        # cache intermedia de wails
-wailsjs/            # bindings generados por Wails (se pueden regenerar)
+build/
+darwin/
+windows/
+wailsjs/
 *.exe
-*.exe~
 *.dll
 *.so
 *.dylib
+*.plist
 
 # === Node / Vite ===
 node_modules/
@@ -23,8 +24,9 @@ pnpm-debug.log*
 *.swo
 
 # === SO ===
-.DS_Store        # macOS
-Thumbs.db        # Windows
+.DS_Store
+Thumbs.db
 
 # === Otros ===
-.env             # si llegás a usar variables de entorno
+.env
+package.json.md5
