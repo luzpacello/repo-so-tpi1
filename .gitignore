@@ -1,32 +1,42 @@
-# === Go / Wails ===
-build/
-darwin/
-windows/
-wailsjs/
+# ==========================
+# Git ignore para repo-so-tpi1
+# ==========================
+
+# --- Wails / Go ---
+SchedulerSimulator/build/
+SchedulerSimulator/darwin/
+SchedulerSimulator/windows/
+SchedulerSimulator/wailsjs/
 *.exe
 *.dll
 *.so
 *.dylib
 *.plist
 
-# === Node / Vite ===
-node_modules/
-frontend/dist/
+# --- Node / Vite / React ---
+SchedulerSimulator/frontend/node_modules/
+SchedulerSimulator/frontend/dist/
+SchedulerSimulator/frontend/dist-ssr/
+*.local
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
+lerna-debug.log*
 
-# === IDE / Editores ===
+# --- IDE / Editores ---
 .vscode/
 .idea/
 *.swp
 *.swo
+!.vscode/extensions.json   # conserva configuración compartida
 
-# === SO ===
+# --- Sistema operativo ---
 .DS_Store
 Thumbs.db
 
-# === Otros ===
+# --- Otros / logs / entorno ---
 .env
 package.json.md5
+logs/
+*.log
