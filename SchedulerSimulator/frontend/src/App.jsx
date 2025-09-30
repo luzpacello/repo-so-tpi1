@@ -1,6 +1,5 @@
 // 
-import { Router } from 'react-router'
-import { Routes, Route } from 'react-router'
+import { Routes, Router, Route } from 'react-router-dom'
 //components
 import Header from './components/Header'
 import Footer from './components/Footer'
@@ -11,17 +10,15 @@ import Resultado from './pages/Resultado'
 function App() {
   return (
     <>
-      <div className="flex flex-col h-screen w-screen bg-pink-50 relative">
-        <div className="flex-1 overflow-auto relative z-10">
+      <div className=" flex flex-col min-h-screen w-screen bg-sky-50">        
         <Header />
-        <Routes>
-          <Route path="/" element={<Carga />} />
-          <Route path="/Resultado" element={<Resultado />} />
-        </Routes>
+        <div className="flex-1 ">
+          <Routes>
+            <Route path="/" element={<Carga />} />
+            <Route path="/Resultado" element={<Resultado />} />
+          </Routes>
         </div>
-        <div className="flex-none relative z-10">
-          <Footer />
-        </div>
+        <Footer />
       </div>
     </>
   )

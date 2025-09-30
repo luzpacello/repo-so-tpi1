@@ -1,0 +1,593 @@
+/*// simulator.go
+package main
+
+import (
+	"fmt"
+	"math"
+	"sort"
+)
+
+// Estado de proceso
+type State int
+
+const (
+	New State = iota
+	Ready
+	Running
+	Blocked
+	Terminated
+)
+
+// Evento enumerado (no usamos heap de eventos; usamos búsqueda del siguiente instante)
+type EventType int
+
+const (
+	Arrive EventType = iota
+	TIPComplete
+	CPUComplete
+	IOComplete
+	Preempt
+	TFPComplete
+	Dispatch // interno cuando TCP finaliza y proceso pasa a running
+)
+
+// Proceso
+type Process struct {
+	Name string
+
+	Arrival float64
+
+	CPUBursts []float64 // ej: [b1,b2,b3]
+	IOBursts  []float64 // ej: [i1,i2] (len = len(CPUBursts)-1 o 0)
+
+	Priority int // no usado en FCFS pero se guarda
+
+	// estado runtime
+	State State
+
+	NextBurst int     // índice de la CPU burst actual
+	RemBurst  float64 // remanente en la ráfaga CPU actual (si preempción)
+
+	// Timestamps / métricas
+	ServiceTime      float64 // suma de CPUBursts (constante)
+	StartTime        *float64
+	CompletionTime   *float64
+	ReadyAccum       float64 // tiempo total en READY (solo después TIP)
+	HasFinishedTIP   bool    // regla c: no se cuenta ready hasta que TIP complete
+	TIPCompleteAt    *float64
+	TFPCompleteAt    *float64
+	FirstRunRecorded bool
+
+	// bookkeeping
+	// when TIP/IO/TFP scheduled to complete
+	NextTIPComplete float64
+	NextIOComplete  float64
+	NextCPUComplete float64
+	NextTFPComplete float64
+}
+
+// Parámetros globales del simulador
+type Params struct {
+	TIP    float64 // tiempo para aceptar nuevos procesos (por proceso)
+	TFP    float64 // tiempo para terminar procesos (por proceso)
+	TCP    float64 // tiempo de conmutación (por despacho)
+	Quantum float64 // si 0 => no preempción por quantum
+}
+
+// Acumuladores de CPU
+type Accumulators struct {
+	CPUProcTime float64 // tiempo total usado por procesos (ejecuciones)
+	CPUOSTime   float64 // TIP + TFP + TCP
+	CPUIdleTime float64
+}
+
+// Simulador principal
+type Simulator struct {
+	Now      float64
+	Params   Params
+	Procs    []*Process
+	ReadyQ   []*Process
+	Running  *Process
+	Acc      Accumulators
+	tPrev    float64
+	Finished int
+	// for preemption: when preemption event would happen
+	PreemptAt float64
+}
+
+// Helper: copy slice
+func copyFloatSlice(s []float64) []float64 {
+	if s == nil {
+		return nil
+	}
+	c := make([]float64, len(s))
+	copy(c, s)
+	return c
+}
+
+// Crear proceso
+func NewProcess(name string, arrival float64, cpuBursts, ioBursts []float64, priority int) *Process {
+	p := &Process{
+		Name:        name,
+		Arrival:     arrival,
+		CPUBursts:   copyFloatSlice(cpuBursts),
+		IOBursts:    copyFloatSlice(ioBursts),
+		Priority:    priority,
+		State:       New,
+		NextBurst:   0,
+		RemBurst:    0,
+		ServiceTime: 0,
+	}
+	for _, b := range p.CPUBursts {
+		p.ServiceTime += b
+	}
+	// initialize RemBurst if has CPU bursts
+	if len(p.CPUBursts) > 0 {
+		p.RemBurst = p.CPUBursts[0]
+	}
+	return p
+}
+
+// Push to ready queue (FIFO). For other policies, change this function.
+func (s *Simulator) pushReady(p *Process) {
+	s.ReadyQ = append(s.ReadyQ, p)
+}
+
+// Pop from ready queue (FIFO)
+func (s *Simulator) popReady() *Process {
+	if len(s.ReadyQ) == 0 {
+		return nil
+	}
+	p := s.ReadyQ[0]
+	s.ReadyQ = s.ReadyQ[1:]
+	return p
+}
+
+// Utility: find next event time among all possible events
+func (s *Simulator) nextEventTime() float64 {
+	// candidates: next arrival, next TIP completion, next IO completion, next CPU completion, next preemption, next TFP completion
+	minT := math.Inf(1)
+	// arrivals
+	for _, p := range s.Procs {
+		if p.State == New {
+			if p.Arrival < minT {
+				minT = p.Arrival
+			}
+		}
+		// TIP completions scheduled
+		if p.State == New && p.TIPCompleteAt != nil {
+			if *p.TIPCompleteAt < minT {
+				minT = *p.TIPCompleteAt
+			}
+		}
+		// IO completions
+		if p.State == Blocked && p.NextIOComplete > 0 {
+			if p.NextIOComplete < minT {
+				minT = p.NextIOComplete
+			}
+		}
+		// CPU completion (if running)
+		if p.State == Running && p.NextCPUComplete > 0 {
+			if p.NextCPUComplete < minT {
+				minT = p.NextCPUComplete
+			}
+		}
+		// TFP completions (if scheduled)
+		if p.TFPCompleteAt != nil {
+			if *p.TFPCompleteAt < minT {
+				minT = *p.TFPCompleteAt
+			}
+		}
+	}
+	// preemption (quantum)
+	if s.Params.Quantum > 0 && s.Running != nil {
+		if s.PreemptAt > 0 && s.PreemptAt < minT {
+			minT = s.PreemptAt
+		}
+	}
+	// If no events, return +Inf
+	return minT
+}
+
+// Advance clock and accumulate ready_time, CPU_proc_time and CPU_idle_time, CPU_os_time accounted elsewhere
+func (s *Simulator) advanceTo(t float64) {
+	if t < s.Now {
+		return
+	}
+	dt := t - s.Now
+	// accumulate ready_time for processes in READY whose TIP is done
+	for _, p := range s.Procs {
+		if p.State == Ready && p.HasFinishedTIP {
+			p.ReadyAccum += dt
+		}
+	}
+	// CPU busy by process?
+	if s.Running != nil {
+		// if Running, then CPU proc time increases
+		s.Acc.CPUProcTime += dt
+	} else {
+		// CPU idle if OS not using CPU (we'll assume TIP/TCP/TFP are scheduled as events that occupy CPU between events)
+		// However TIP/TCP/TFP increments are done at the moment of scheduling (atomic) below; here we consider idle
+		s.Acc.CPUIdleTime += dt
+	}
+	s.Now = t
+}
+
+// Helper: schedule TIP start when arrival occurs
+func (s *Simulator) handleArrival(p *Process) {
+	// Rule: when arrival at time Now, TIP applies (if TIP>0). During TIP CPU is used by OS.
+	// We'll set TIPCompleteAt = Now + TIP and mark CPU as OS-time during that interval by incrementing Acc.CPUOSTime.
+	if s.Params.TIP > 0 {
+		// TIP consumes CPU_os_time immediately (atomic)
+		s.Acc.CPUOSTime += s.Params.TIP
+		end := s.Now + s.Params.TIP
+		p.TIPCompleteAt = &end
+		p.NextTIPComplete = end
+		// Keep p in New until TIPCompleteAt
+		p.State = New
+	} else {
+		// immediately move to READY
+		p.State = Ready
+		p.HasFinishedTIP = true
+		p.TIPCompleteAt = nil
+		s.pushReady(p)
+	}
+}
+
+// Helper: when TIP completes
+func (s *Simulator) handleTIPComplete(p *Process) {
+	p.TIPCompleteAt = nil
+	p.HasFinishedTIP = true
+	p.State = Ready
+	s.pushReady(p)
+}
+
+// Helper: dispatch (takes process from ready->running) with TCP overhead
+func (s *Simulator) dispatchNext() {
+	if s.Running != nil {
+		return // CPU busy
+	}
+	next := s.popReady()
+	if next == nil {
+		return
+	}
+	// perform TCP (OS time). We'll treat TCP as atomic cost added to CPU OSTime.
+	if s.Params.TCP > 0 {
+		s.Acc.CPUOSTime += s.Params.TCP
+		// Advance time by TCP (note: could create concurrent events during TCP in real systems,
+		// but we model TCP atomically per your instructions for simplicity)
+		// Before advancing, accumulate ready_time etc from previous Now to Now+TCP
+		s.advanceTo(s.Now + s.Params.TCP)
+	}
+	// Now set Running
+	next.State = Running
+	s.Running = next
+	// mark first run
+	if !next.FirstRunRecorded {
+		t := s.Now
+		next.StartTime = &t
+		next.FirstRunRecorded = true
+	}
+	// set CPU completion or preemption time
+	remaining := next.RemBurst
+	if remaining <= 0 {
+		remaining = 0
+	}
+	if s.Params.Quantum > 0 && s.Params.Quantum < remaining {
+		// preemption will occur
+		s.PreemptAt = s.Now + s.Params.Quantum
+		// CPU completion still will be at Now + remaining, but preemption happens first.
+		next.NextCPUComplete = s.Now + remaining
+	} else {
+		// no preemption (either quantum=0 or quantum >= remaining)
+		s.PreemptAt = 0
+		next.NextCPUComplete = s.Now + remaining
+	}
+	// set NextCPUComplete in process
+}
+
+// Helper: handle CPU completion for running
+func (s *Simulator) handleCPUComplete(p *Process) {
+	// we assume p is Running and the CPU burst finished at s.Now
+	// consume the remainder exactly
+	elapsed := p.RemBurst
+	if elapsed < 0 {
+		elapsed = 0
+	}
+	// reduce remburst to zero
+	p.RemBurst = 0
+	p.NextCPUComplete = 0
+	// Decide if it was final burst
+	isLast := (p.NextBurst == len(p.CPUBursts)-1)
+	if isLast {
+		// Schedule TFP if TFP>0. TFP consumes OS CPU time
+		if s.Params.TFP > 0 {
+			s.Acc.CPUOSTime += s.Params.TFP
+			tfpEnd := s.Now + s.Params.TFP
+			p.TFPCompleteAt = &tfpEnd
+			// Running process is now in a "terminating" state: we remove it from RUNNING
+			p.State = New // temporary to avoid being counted as running; will set Terminated at TFPComplete
+			s.Running = nil
+			// Note: we consider completion_time to be when TFP finishes
+		} else {
+			// immediate termination
+			end := s.Now
+			p.CompletionTime = &end
+			p.State = Terminated
+			s.Running = nil
+			s.Finished++
+		}
+	} else {
+		// move to Blocked for IO
+		// schedule IO completion
+		ioDur := p.IOBursts[p.NextBurst]
+		p.NextBurst++
+		// set next CPU rem burst for after IO
+		p.RemBurst = p.CPUBursts[p.NextBurst]
+		// schedule IO completion at Now + ioDur. According to your rule, blocked->ready is instant at completion time.
+		p.NextIOComplete = s.Now + ioDur
+		p.State = Blocked
+		s.Running = nil
+	}
+}
+
+// Handle preemption
+func (s *Simulator) handlePreempt(p *Process) {
+	// Preempt at s.Now; update rem burst
+	if p == nil || p.State != Running {
+		return
+	}
+	// compute elapsed since it started running until now:
+	// assume that when we dispatched, NextCPUComplete was set to now+remaining
+	// so elapsed = previously remaining - (NextCPUComplete - Now)
+	// but simpler: elapsed = min(quantum, remaining originally set)
+	// We track remaining via RemBurst, so:
+	elapsed := s.Params.Quantum
+	if elapsed > p.RemBurst {
+		elapsed = p.RemBurst
+	}
+	p.RemBurst -= elapsed
+	// set state to READY and push to ready queue
+	p.State = Ready
+	s.pushReady(p)
+	// clear running
+	s.Running = nil
+	// reset preemptAt
+	s.PreemptAt = 0
+}
+
+// Handle IO completion (blocked->ready instant)
+func (s *Simulator) handleIOComplete(p *Process) {
+	p.NextIOComplete = 0
+	p.State = Ready
+	s.pushReady(p)
+}
+
+// Handle TFP completion (finish termination)
+func (s *Simulator) handleTFPComplete(p *Process) {
+	if p.TFPCompleteAt == nil {
+		return
+	}
+	// mark completion time at Now
+	end := s.Now
+	p.CompletionTime = &end
+	p.TFPCompleteAt = nil
+	p.State = Terminated
+	s.Finished++
+}
+
+// Find processes that have events at current time and process them in the required order:
+// 1) Running -> Terminated
+// 2) Running -> Blocked
+// 3) Running -> Ready (preempted or voluntarily yielded)
+// 4) Blocked -> Ready (IO complete)
+// 5) New -> Ready (TIP complete or immediate arrival+TIP=0)
+// 6) Finally dispatch Ready -> Running (includes TCP)
+func (s *Simulator) processEventsAtNow() {
+	// 1) Running -> Terminated (i.e., running process whose last burst finished right now AND TFP==0 case handled there)
+	if s.Running != nil {
+		p := s.Running
+		// CPUComplete occurs if NextCPUComplete == Now (or within float eps)
+		if p.NextCPUComplete > 0 && nearlyEqual(p.NextCPUComplete, s.Now) {
+			// check if last burst
+			isLast := (p.NextBurst == len(p.CPUBursts)-1)
+			if isLast && s.Params.TFP == 0 {
+				// handle immediate termination
+				s.handleCPUComplete(p)
+			}
+			// else we'll handle in next steps
+		}
+	}
+	// But we need a robust order: we'll inspect all processes and perform actions by priority:
+	// Build lists of processes matching conditions at this time.
+	// 1) Running -> Terminated (cases where CPU finished AND is last burst AND TFP==0)
+	for _, p := range s.Procs {
+		if p.State == Running && p.NextCPUComplete > 0 && nearlyEqual(p.NextCPUComplete, s.Now) {
+			isLast := (p.NextBurst == len(p.CPUBursts)-1)
+			if isLast && s.Params.TFP == 0 {
+				s.handleCPUComplete(p)
+			}
+		}
+	}
+	// 2) Running -> Blocked (CPU burst finished and IO follows)
+	for _, p := range s.Procs {
+		if p.State == Running && p.NextCPUComplete > 0 && nearlyEqual(p.NextCPUComplete, s.Now) {
+			isLast := (p.NextBurst == len(p.CPUBursts)-1)
+			if !isLast {
+				// has IO next
+				s.handleCPUComplete(p)
+			}
+		}
+	}
+	// 3) Running -> Ready (preemption or voluntary yield)
+	// Preemption event
+	if s.Params.Quantum > 0 && s.Running != nil && nearlyEqual(s.PreemptAt, s.Now) {
+		s.handlePreempt(s.Running)
+	}
+	// 4) Blocked -> Ready (IO completion). IO completions may be multiple at same time.
+	for _, p := range s.Procs {
+		if p.State == Blocked && p.NextIOComplete > 0 && nearlyEqual(p.NextIOComplete, s.Now) {
+			// According to rules, blocked->ready is instant and consumes 0 time
+			s.handleIOComplete(p)
+		}
+	}
+	// 5) New -> Ready (TIP complete) OR arrival with TIP==0
+	for _, p := range s.Procs {
+		// arrivals: if p.State==New and Arrival == Now and TIP==0, move immediately to Ready.
+		if p.State == New && nearlyEqual(p.Arrival, s.Now) && s.Params.TIP == 0 && !p.HasFinishedTIP {
+			p.HasFinishedTIP = true
+			p.State = Ready
+			s.pushReady(p)
+		}
+		// TIP completions
+		if p.State == New && p.TIPCompleteAt != nil && nearlyEqual(*p.TIPCompleteAt, s.Now) {
+			s.handleTIPComplete(p)
+		}
+	}
+	// 6) TFP completions (should be considered before dispatch? You specified Corriendo->Terminado first; TFP completion is finishing OS finalization - it should be processed now)
+	for _, p := range s.Procs {
+		if p.TFPCompleteAt != nil && nearlyEqual(*p.TFPCompleteAt, s.Now) {
+			s.handleTFPComplete(p)
+		}
+	}
+	// Finally: dispatch if CPU free
+	if s.Running == nil {
+		s.dispatchNext()
+	}
+}
+
+// float comparison helper
+func nearlyEqual(a, b float64) bool {
+	return math.Abs(a-b) < 1e-9
+}
+
+// Run simulation until all processes terminated
+func (s *Simulator) Run() {
+	// initialize Now to min arrival
+	first := math.Inf(1)
+	for _, p := range s.Procs {
+		if p.Arrival < first {
+			first = p.Arrival
+		}
+	}
+	if math.IsInf(first, 1) {
+		first = 0
+	}
+	s.Now = first
+	s.tPrev = s.Now
+
+	// initial check: if some processes arrive at t==first, handle arrivals
+	for _, p := range s.Procs {
+		if nearlyEqual(p.Arrival, s.Now) {
+			// schedule TIP or ready
+			s.handleArrival(p)
+		}
+	}
+
+	// main loop
+	for s.Finished < len(s.Procs) {
+		// choose next event time
+		next := s.nextEventTime()
+		if math.IsInf(next, 1) {
+			// nothing else scheduled -> break to avoid infinite loop
+			break
+		}
+		// advance time and account metrics between s.Now and next (advanceTo will update Now)
+		s.advanceTo(next)
+
+		// process events that occur exactly at s.Now following order
+		s.processEventsAtNow()
+	}
+
+	// Simulation ended; set completion times for any that finished without TFP recorded (edge)
+	for _, p := range s.Procs {
+		if p.State == Terminated && p.CompletionTime == nil {
+			t := s.Now
+			p.CompletionTime = &t
+		}
+	}
+	// compute CPU_os_time already accumulated at scheduling points (TIP,TCP,TFP)
+	// T_total is from min arrival to last completion_time
+}
+
+// Print results
+func (s *Simulator) PrintResults() {
+	// determine T_total
+	start := math.Inf(1)
+	end := 0.0
+	for _, p := range s.Procs {
+		if p.Arrival < start {
+			start = p.Arrival
+		}
+		if p.CompletionTime != nil && *p.CompletionTime > end {
+			end = *p.CompletionTime
+		}
+	}
+	Ttotal := end - start
+	if Ttotal <= 0 {
+		Ttotal = s.Now - start
+	}
+	fmt.Printf("\n=== RESULTADOS (Simulación terminada en t=%.3f) ===\n\n", s.Now)
+	fmt.Printf("%-6s %-7s %-9s %-9s %-9s %-9s\n", "Proc", "Arrival", "Service", "Turnaround", "TurnNorm", "Ready")
+	totalTurn := 0.0
+	for _, p := range s.Procs {
+		turn := 0.0
+		if p.CompletionTime != nil {
+			turn = *p.CompletionTime - p.Arrival
+		}
+		norm := 0.0
+		if p.ServiceTime > 0 {
+			norm = turn / p.ServiceTime
+		}
+		fmt.Printf("%-6s %-7.2f %-9.2f %-9.2f %-9.2f %-9.2f\n",
+			p.Name, p.Arrival, p.ServiceTime, turn, norm, p.ReadyAccum)
+		totalTurn += turn
+	}
+	meanTurn := totalTurn / float64(len(s.Procs))
+	fmt.Printf("\nTanda: SumTurn=%.3f  MeanTurn=%.3f\n", totalTurn, meanTurn)
+
+	// CPU times
+	// Note: CPUOSTime already includes TIP/TFP/TCP sums.
+	fmt.Printf("\nUso CPU (absoluto):\n")
+	fmt.Printf(" CPU procesos: %.3f\n", s.Acc.CPUProcTime)
+	fmt.Printf(" CPU sistema (TIP+TFP+TCP): %.3f\n", s.Acc.CPUOSTime)
+	fmt.Printf(" CPU idle: %.3f\n", s.Acc.CPUIdleTime)
+	fmt.Printf(" T_total (intervalo): %.3f\n", Ttotal)
+	if Ttotal > 0 {
+		fmt.Printf("\nUso CPU (porcentual):\n")
+		fmt.Printf(" %% procesos: %.2f%%\n", 100*s.Acc.CPUProcTime/Ttotal)
+		fmt.Printf(" %% sistema: %.2f%%\n", 100*s.Acc.CPUOSTime/Ttotal)
+		fmt.Printf(" %% idle: %.2f%%\n", 100*s.Acc.CPUIdleTime/Ttotal)
+	}
+	fmt.Printf("\n(Comprobación) Sum parts = %.3f, T_total = %.3f\n", s.Acc.CPUProcTime+s.Acc.CPUOSTime+s.Acc.CPUIdleTime, Ttotal)
+}
+
+// Example usage
+func main() {
+	// Ejemplo: 3 procesos con CPU/IO, TIP/TCP/TFP definidos
+	procs := []*Process{
+		NewProcess("P1", 0.0, []float64{5.0, 3.0}, []float64{4.0}, 1),
+		NewProcess("P2", 1.0, []float64{3.0}, nil, 1),
+		NewProcess("P3", 2.0, []float64{4.0, 2.0}, []float64{2.0}, 1),
+	}
+
+	params := Params{
+		TIP:    0.5, // tiempo para aceptar cada proceso
+		TFP:    0.2, // tiempo para terminar proceso
+		TCP:    0.1, // conmutación
+		Quantum: 0,  // 0 => FCFS no-preemptivo. Pon >0 para RR-like preempción.
+	}
+
+	sim := &Simulator{
+		Params: params,
+		Procs:  procs,
+	}
+	// order processes by arrival for determinism
+	sort.Slice(sim.Procs, func(i, j int) bool {
+		return sim.Procs[i].Arrival < sim.Procs[j].Arrival
+	})
+
+	sim.Run()
+	sim.PrintResults()
+}
+*/

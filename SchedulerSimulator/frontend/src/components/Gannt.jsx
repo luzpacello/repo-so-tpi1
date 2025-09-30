@@ -1,32 +1,44 @@
 import React from "react"
 
-function Gantt({ procesos, escala = 50 }){
-    return(
-        <div className="p-4 border rounded-lg bg-white shadow-md">
+const colors = [
+  "bg-blue-500",
+  "bg-green-500",
+  "bg-purple-500",
+  "bg-pink-500",
+  "bg-yellow-500",
+  "bg-red-500",
+]
+
+function Gantt({ procesos = [], escala = 50, loading = false }) {
+  // Overlay de carga
+  if (loading) {
+    return (
+      <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center text-white z-50">
+        Cargando...
+      </div>
+    )
+  }
+
+  // Si no hay procesos
+  if (!procesos || procesos.length === 0) {
+    return <p className="text-gray-500">No hay procesos para mostrar</p>
+  }
+
+  // Calcular tiempo total
+  const tiempoTotal = Math.max(
+    0,
+    ...procesos.flatMap((p) =>
+      p.Intervals ? p.Intervals.map((int) => int.End) : [0]
+    )
+  )
+
+  return (
+    <div className="p-4 border rounded-lg bg-white shadow-md overflow-x-auto">
       <h3 className="text-xl font-bold mb-4">Diagrama de Gantt</h3>
-
-      <div className="space-y-2">
-        {procesos.map((p, idx) => (
-          <div key={idx} className="flex items-center">
-            {/* Nombre del proceso */}
-            <span className="w-16 font-semibold">{p.nombre}</span>
-
-            {/* Barras de Gantt */}
-            <div className="flex">
-              {p.rafagas.map((duracion, i) => (
-                <div
-                  key={i}
-                  className="h-8 bg-blue-400 border border-black flex items-center justify-center text-xs"
-                  style={{ width: `${duracion * escala}px` }}
-                >
-                  {duracion}
-                </div>
-              ))}
-            </div>
-          </div>
-        ))}
+      <div className="">
       </div>
     </div>
-    )
+  )
 }
+
 export default Gantt
